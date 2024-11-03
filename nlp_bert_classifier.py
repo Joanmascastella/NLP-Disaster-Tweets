@@ -1,83 +1,92 @@
-# Libraries
+# Import Libraries
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import RidgeClassifier
-from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
-from sklearn.preprocessing import StandardScaler
-from transformers import BertTokenizerFast, BertModel
-import torch
-from scipy.stats import uniform
+from sklearn.model_selection import KFold
+from sklearn.metrics import f1_score
+from transformers import BertTokenizer, BertModel
 
-# Class Imports
-from helpful_functions import get_device
+# Import functions
+from helpful_functions import *
 
 # Define Device
 device = get_device()
 
-# Defining file paths
+# Load train and test data into their respective data frames
 train_df = pd.read_csv('./data/train.csv')
 test_df = pd.read_csv('./data/test.csv')
-submission_df = pd.read_csv('./data/sample_submission.csv')
 
-# Initialize Tokenizer And Bert Model
-tokenizer = BertTokenizerFast.from_pretrained('bert-base-cased')
-model = BertModel.from_pretrained('bert-base-cased').to(device)
-model.eval() # Set To Eval Mode
+# Initialize BERT tokenizer and model
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertModel.from_pretrained('bert-base-uncased')
+model.eval()  # Set the model to evaluation mode
 
-
-def get_bert_embeddings(texts, layer_aggregation='last_4_mean', batch_size=16):
-    """Get BERT embeddings for a list of texts in batches, using the specified device."""
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        encoded_input = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt').to(device)
-        with torch.no_grad():
-            output = model(**encoded_input)
-
-        if layer_aggregation == 'last':
-            embeddings = output.last_hidden_state.mean(dim=1).cpu().numpy()
-        elif layer_aggregation == 'last_4_mean':
-            embeddings = torch.mean(torch.stack(output.hidden_states[-4:]), dim=0).mean(dim=1).cpu().numpy()
-
-        all_embeddings.append(embeddings)
-    return np.vstack(all_embeddings)
+def get_bert_embeddings(texts):
+    """Get BERT embeddings for a list of texts."""
+    encoded_input = tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
+    with torch.no_grad():
+        output = model(**encoded_input)
+    # Use the mean of the last hidden state as the embedding
+    embeddings = output.last_hidden_state.mean(dim=1).numpy()
+    return embeddings
 
 # Generate BERT embeddings for train and test datasets
-train_embeddings = get_bert_embeddings(train_df["text"].tolist(), layer_aggregation='last_4_mean')
-test_embeddings = get_bert_embeddings(test_df["text"].tolist(), layer_aggregation='last_4_mean')
+train_embeddings = get_bert_embeddings(train_df["text"].tolist())
+test_embeddings = get_bert_embeddings(test_df["text"].tolist())
 
-# Scale embeddings
-scaler = StandardScaler()
-train_embeddings = scaler.fit_transform(train_embeddings)
-test_embeddings = scaler.transform(test_embeddings)
-
-# Define the RidgeClassifier model and parameter distribution
-ridge_model = RidgeClassifier()
-param_distributions = {
-    'alpha': uniform(0.001, 100),
-    'solver': ['auto', 'svd', 'cholesky', 'lsqr', 'sag']
+# Define hyperparameters to test
+param_grid = {
+    'alpha': [0.1, 1.0, 10.0],  # Regularization strength for RidgeClassifier
 }
 
-# Use StratifiedKFold for cross-validation
-kf = StratifiedKFold(n_splits=3, shuffle=True, random_state=43)
+best_f1 = 0
+best_params = None
 
-# Perform RandomizedSearchCV to find the best hyperparameters
-random_search = RandomizedSearchCV(ridge_model, param_distributions, n_iter=30, scoring='f1', cv=kf, n_jobs=-1, random_state=42)
-random_search.fit(train_embeddings, train_df["target"])
+# Perform manual hyperparameter tuning
+for alpha in param_grid['alpha']:
+    print(f"Testing model with alpha={alpha}")
 
-# Get the best model and parameters
-best_model = random_search.best_estimator_
-best_params = random_search.best_params_
-print(f"Best parameters: {best_params} with F1 Score: {random_search.best_score_}")
+    # Perform cross-validation
+    kf = KFold(n_splits=3, shuffle=True, random_state=43)
+    f1_scores = []
 
-# Predict on the test set with the best model
+    for train_index, val_index in kf.split(train_embeddings):
+        X_train, X_val = train_embeddings[train_index], train_embeddings[val_index]
+        y_train, y_val = train_df["target"].values[train_index], train_df["target"].values[val_index]
+
+        # Build and train the RidgeClassifier model
+        model = RidgeClassifier(alpha=alpha)
+        model.fit(X_train, y_train)
+
+        # Predict and calculate F1 score
+        y_pred = model.predict(X_val)
+        f1 = f1_score(y_val, y_pred)
+        f1_scores.append(f1)
+
+    # Calculate average F1 score for this set of hyperparameters
+    average_f1 = np.mean(f1_scores)
+    print(f"Average F1 Score: {average_f1}")
+
+    # Update best parameters if current model is better
+    if average_f1 > best_f1:
+        best_f1 = average_f1
+        best_params = {
+            'alpha': alpha
+        }
+
+print(f"Best parameters: {best_params} with F1 Score: {best_f1}")
+
+# Train the final model with the best hyperparameters
+best_model = RidgeClassifier(alpha=best_params['alpha'])
+best_model.fit(train_embeddings, train_df["target"])
+
+# Predict on the test set
 test_predictions = best_model.predict(test_embeddings)
 
-# Prepare the submission file
-submission_df["target"] = test_predictions
+# Prepare submission file
+sample_submission = pd.read_csv("./data/sample_submission.csv")
+sample_submission["target"] = test_predictions
 
-# Save the submission file
-submission_df.to_csv("./data/submission.csv", index=False)
-
-
-
+# Print and save the submission file
+print(sample_submission.head())
+sample_submission.to_csv("./data/submission.csv", index=False)
